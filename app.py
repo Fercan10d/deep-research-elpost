@@ -341,7 +341,8 @@ def generate_pdf(report: str, executive_summary: str, topic: str, sources: list,
                 spaceBefore=6, spaceAfter=10,
             ))
             elements.append(Paragraph("RESUMEN EJECUTIVO", styles['ExecTitle']))
-            safe_summary = executive_summary.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            safe_summary = executive_summary.encode('latin-1', errors='replace').decode('latin-1')
+            safe_summary = safe_summary.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             safe_summary = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', safe_summary)
             safe_summary = re.sub(r'\*(.+?)\*', r'<i>\1</i>', safe_summary)
             elements.append(Paragraph(safe_summary, styles['ExecSummary']))
@@ -349,6 +350,8 @@ def generate_pdf(report: str, executive_summary: str, topic: str, sources: list,
 
         # Convert markdown to paragraphs
         def sanitize(text):
+            # Reemplazar caracteres Unicode problemáticos para Helvetica
+            text = text.encode('latin-1', errors='replace').decode('latin-1')
             text = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
             text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
@@ -461,6 +464,10 @@ def generate_pdf(report: str, executive_summary: str, topic: str, sources: list,
         doc.build(elements)
         return buffer.getvalue()
     except ImportError:
+        return None
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -760,13 +767,17 @@ def run_investigation(config: ResearchConfig):
         )
     with dl_col2:
         logo_b64 = get_logo_base64()
-        pdf_data = generate_pdf(
-            state.final_report,
-            state.executive_summary,
-            config.topic,
-            [s for s in state.all_sources if s.url in seen],
-            logo_b64,
-        )
+        try:
+            pdf_data = generate_pdf(
+                state.final_report,
+                state.executive_summary,
+                config.topic,
+                [s for s in state.all_sources if s.url in seen],
+                logo_b64,
+            )
+        except Exception as e:
+            pdf_data = None
+            st.error(f"Error generando PDF: {e}")
         if pdf_data:
             st.download_button(
                 "Descargar .pdf",
@@ -774,6 +785,8 @@ def run_investigation(config: ResearchConfig):
                 file_name=f"investigacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
                 mime="application/pdf",
             )
+        else:
+            st.warning("No se pudo generar el PDF.")
 
 
 # ── Página: Historial ────────────────────────────────────────────────────────
