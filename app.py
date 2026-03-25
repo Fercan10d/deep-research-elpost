@@ -645,7 +645,7 @@ def render_new_research():
             angle=angle.strip(),
             scope=scope.strip(),
             source_type=source_type,
-            mode="fast",
+            mode="mid",
         )
         run_investigation(config)
 

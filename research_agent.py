@@ -663,18 +663,25 @@ def run_research(
     status(f"**Total de casos identificados: {total_cases}**")
 
     # ════════════════════════════════════════════════════════════════════════
-    # FASE 2: PROFUNDIZACIÓN (solo en modo full)
+    # FASE 2: PROFUNDIZACIÓN
     # ════════════════════════════════════════════════════════════════════════
-    if config.mode == "full":
+    # Configuración según modo
+    mode_config = {
+        "fast":  {"max_cases": 0,  "queries_per_case": 0},
+        "mid":   {"max_cases": 5,  "queries_per_case": 1},
+        "full":  {"max_cases": 10, "queries_per_case": 3},
+    }
+    mc = mode_config.get(config.mode, mode_config["mid"])
+
+    if mc["max_cases"] > 0:
         status("**FASE 2: Profundización**")
-        status("Investigando cada caso en detalle...")
+        status("Investigando los casos más importantes en detalle...")
 
         # Ordenar por importancia
         importance_order = {"alto": 0, "medio": 1, "bajo": 2}
         sorted_cases = sorted(cases, key=lambda c: importance_order.get(c.get("importance", "medio"), 1))
 
-        # Investigar máximo 10 casos
-        max_deep_dive = min(len(sorted_cases), 10)
+        max_deep_dive = min(len(sorted_cases), mc["max_cases"])
         cases_to_investigate = sorted_cases[:max_deep_dive]
 
         if len(sorted_cases) > max_deep_dive:
@@ -687,7 +694,8 @@ def run_research(
 
             # Generar queries específicas [HAIKU]
             status("Generando consultas específicas...")
-            queries = generate_deep_dive_queries(claude, case, config)
+            all_queries = generate_deep_dive_queries(claude, case, config)
+            queries = all_queries[:mc["queries_per_case"]]
 
             # Buscar en Perplexity con modo detallado
             case_contents = []
