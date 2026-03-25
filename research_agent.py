@@ -1,6 +1,7 @@
 """
 Agente de Deep Research híbrido: Perplexity (búsqueda) + Claude (análisis y síntesis).
 Estrategia de dos fases: descubrimiento amplio + profundización caso por caso.
+Inspirado en dzhng/deep-research: learnings concretos + research goals por query.
 Optimizado para costos: Haiku para tareas mecánicas, Sonnet solo para análisis crítico.
 """
 
@@ -13,7 +14,7 @@ from anthropic import Anthropic
 
 # ── Modelos ─────────────────────────────────────────────────────────────────
 MODEL_HEAVY = "claude-sonnet-4-20250514"   # Análisis complejo y síntesis
-MODEL_LIGHT = "claude-haiku-4-5-20251001"  # Generación de queries, tareas mecánicas
+MODEL_LIGHT = "claude-haiku-4-5-20251001"  # Generación de queries, extracción de learnings
 
 
 @dataclass
@@ -32,8 +33,9 @@ class RoundResult:
     gaps: list[str]
     coverage_score: int
     follow_up_queries: list[str]
+    learnings: list[str] = field(default_factory=list)
     phase: str = "discovery"  # "discovery" o "deep_dive"
-    case_name: str = ""  # Nombre del caso investigado (solo en deep_dive)
+    case_name: str = ""
 
 
 @dataclass
@@ -43,7 +45,7 @@ class ResearchConfig:
     angle: str = ""
     scope: str = ""
     source_type: str = "Todos"
-    mode: str = "full"  # "full" (dos fases) o "fast" (solo descubrimiento + síntesis)
+    mode: str = "full"  # "full", "mid", "fast"
 
 
 @dataclass
@@ -55,6 +57,7 @@ class ResearchState:
     executive_summary: str = ""
     contradictions: list[str] = field(default_factory=list)
     all_sources: list[Source] = field(default_factory=list)
+    all_learnings: list[str] = field(default_factory=list)
     status: str = "pending"
     discovered_cases: list[dict] = field(default_factory=list)
 
@@ -68,12 +71,17 @@ Genera consultas de búsqueda diseñadas para MAPEAR el universo completo de cas
 IMPORTANTE:
 - Genera consultas tanto en ESPAÑOL como en INGLÉS (al menos 2 en cada idioma).
 - Las consultas deben buscar: listas de casos, cronologías, investigaciones judiciales, nombres de involucrados, incidentes documentados.
-- Usa operadores de búsqueda cuando sea útil (comillas para frases exactas, etc.)
 
 {context_instructions}
 
-Responde SOLO con un JSON array de strings. Genera entre 5 y 6 consultas.
-Ejemplo: ["lista de casos de corrupción en [tema] 2020-2025", "cronología investigaciones judiciales [tema]", "all corruption cases [topic] timeline", "key figures involved [topic] investigation"]"""
+Responde SOLO con un JSON array de objetos. Genera entre 5 y 6 consultas.
+Cada objeto tiene "query" (la consulta) y "research_goal" (qué esperas descubrir con esta consulta y cómo avanzará la investigación).
+
+Ejemplo:
+[
+  {{"query": "lista casos corrupción gobierno Arce Bolivia 2020-2025", "research_goal": "Mapear todos los escándalos documentados durante el período presidencial, identificar nombres de ministros y funcionarios involucrados"}},
+  {{"query": "Bolivia corruption cases Arce government timeline", "research_goal": "Obtener perspectiva internacional y casos cubiertos por medios extranjeros que los locales podrían omitir"}}
+]"""
 
 DISCOVERY_ANALYSIS_PROMPT = """Eres un analista de investigación periodística de primer nivel. Tu tarea es analizar los resultados de búsqueda e IDENTIFICAR TODOS LOS CASOS, EVENTOS O SUBTEMAS ESPECÍFICOS que existen dentro del tema investigado.
 
@@ -107,9 +115,8 @@ Responde SOLO con un JSON con esta estructura exacta:
 
 INSTRUCCIONES CRÍTICAS:
 - NO seas genérico. Cada caso debe tener NOMBRES, FECHAS y DATOS CONCRETOS.
-- Si encuentras referencias a casos adicionales que no están bien documentados en los resultados, inclúyelos con lo que tengas.
 - "discovery_completeness" es 0-100: qué tan seguro estás de haber identificado TODOS los casos relevantes.
-- Prioriza casos por importancia. Los de importancia "alto" serán investigados primero."""
+- Prioriza casos por importancia."""
 
 DEEP_DIVE_QUERY_PROMPT = """Genera consultas de búsqueda ultra-específicas para investigar a fondo este caso:
 
@@ -117,20 +124,55 @@ DEEP_DIVE_QUERY_PROMPT = """Genera consultas de búsqueda ultra-específicas par
 ## Descripción: {case_description}
 ## Actores clave: {key_actors}
 ## Tema general: {topic}
+## Learnings previos: {prior_learnings}
 
 {context_instructions}
 
 Las consultas deben buscar: cronología detallada, nombres completos con cargos, montos exactos, estado de procesos judiciales, declaraciones oficiales, documentos fuente.
 
-Genera en ESPAÑOL e INGLÉS. Responde SOLO con un JSON array de strings. Genera 3 consultas.
-Ejemplo: ["nombre persona caso nombre_caso sentencia 2025", "case name court ruling details", "caso nombre cifras auditoria"]"""
+Genera en ESPAÑOL e INGLÉS. Responde SOLO con un JSON array de objetos. Genera 3 consultas.
+Cada objeto tiene "query" y "research_goal".
 
-CROSS_VERIFICATION_PROMPT = """Eres un verificador de hechos (fact-checker) periodístico de primer nivel. Analiza los siguientes hallazgos recopilados de múltiples fuentes y realiza una verificación cruzada rigurosa.
+Ejemplo:
+[
+  {{"query": "Edwin Characayo soborno tierras Bolivia sentencia 2022", "research_goal": "Obtener detalles de la sentencia, monto exacto, duración de condena y estado actual del caso"}},
+  {{"query": "Characayo Bolivia bribery land titling conviction details", "research_goal": "Fuentes internacionales con datos adicionales no cubiertos por medios locales"}}
+]"""
+
+EXTRACT_LEARNINGS_PROMPT = """Analiza el siguiente contenido de búsqueda sobre el caso "{case_name}" y extrae los datos más importantes como learnings concretos.
+
+## Contenido de búsqueda:
+{search_content}
+
+## Objetivo de investigación:
+{research_goal}
+
+Extrae entre 5 y 10 learnings. Cada learning debe ser UNA FRASE concreta, densa en información, que incluya:
+- Nombres completos con cargos
+- Fechas exactas
+- Montos y cifras
+- Entidades específicas (empresas, instituciones, tribunales)
+- Estado actual (detenido, prófugo, condenado, etc.)
+
+Responde SOLO con un JSON:
+{{
+    "learnings": [
+        "Luis Alberto Arce Catacora fue detenido el 10 de diciembre de 2025 en el barrio Sopocachi de La Paz por el caso FONDIOC, con detención preventiva de 5 meses en la cárcel de San Pedro.",
+        "El FONDIOC manejó 3.197 millones de bolivianos (USD 460 millones) entre 2006-2014, con un daño estimado por el fiscal Miguel Cardozo de 925 millones de bolivianos en 3.500 proyectos.",
+        "De 3.462 proyectos aprobados entre 2010-2013, solo 1 cumplió todos los requisitos según la Contraloría."
+    ],
+    "contradictions": ["Dato en disputa si existe"],
+    "gaps": ["Información que falta"]
+}}
+
+CRÍTICO: NO seas vago. Cada learning es un dato VERIFICABLE con nombre, fecha o cifra. Si no tiene datos concretos, no lo incluyas."""
+
+CROSS_VERIFICATION_PROMPT = """Eres un verificador de hechos (fact-checker) periodístico de primer nivel. Analiza los siguientes learnings recopilados de múltiples fuentes y realiza una verificación cruzada rigurosa.
 
 ## Tema: {topic}
 
-## Hallazgos de todas las rondas:
-{all_findings}
+## Learnings recopilados:
+{all_learnings}
 
 ## Contradicciones detectadas previamente:
 {contradictions}
@@ -149,7 +191,7 @@ EXECUTIVE_SUMMARY_PROMPT = """Eres un editor periodístico senior. Genera un res
 
 ## Casos descubiertos: {num_cases}
 
-## Hallazgos principales:
+## Learnings principales:
 {key_findings}
 
 ## Verificación:
@@ -163,7 +205,7 @@ Escribe un resumen de MÁXIMO 200 palabras en español. Debe responder:
 
 No uses encabezados, negritas, asteriscos ni ningún formato markdown. Solo texto directo y conciso en prosa corrida. Incluye cifras y nombres cuando sea posible."""
 
-SYNTHESIS_PROMPT = """Eres un redactor de investigación periodística de un medio de comunicación en español. Genera un informe de investigación exhaustivo, detallado y verificable basado en TODOS los hallazgos recopilados.
+SYNTHESIS_PROMPT = """Eres un redactor de investigación periodística de un medio de comunicación en español. Genera un informe de investigación exhaustivo, detallado y verificable basado en TODOS los learnings recopilados.
 
 ## Tema de investigación
 {topic}
@@ -174,8 +216,8 @@ SYNTHESIS_PROMPT = """Eres un redactor de investigación periodística de un med
 ## Panorama general descubierto
 {overview}
 
-## Casos individuales investigados
-{cases_detail}
+## Learnings por caso
+{cases_learnings}
 
 ## Verificación cruzada
 {verification}
@@ -194,7 +236,7 @@ Genera el informe con la siguiente estructura en Markdown:
 
 ## Casos Documentados
 
-(Para CADA caso investigado, genera una subsección con esta estructura:)
+(Para CADA caso, genera una subsección con esta estructura:)
 
 ### [Número]. [Nombre del Caso]
 
@@ -216,7 +258,7 @@ Genera el informe con la siguiente estructura en Markdown:
 (Análisis transversal: patrones comunes entre casos, conexiones entre actores, tendencias temporales)
 
 ## Verificación y Confiabilidad
-(Datos confirmados por múltiples fuentes, datos en disputa, afirmaciones no verificadas. CRÍTICO para rigor periodístico.)
+(Datos confirmados por múltiples fuentes, datos en disputa, afirmaciones no verificadas)
 
 ## Vacíos Informativos y Limitaciones
 (Qué no se pudo verificar, qué información falta, qué líneas de investigación quedan abiertas)
@@ -231,11 +273,10 @@ INSTRUCCIONES CRÍTICAS:
 - Cita las fuentes usando [n] donde n es el número de la fuente en la lista final.
 - CADA caso debe tener NOMBRES COMPLETOS, FECHAS, MONTOS y DESENLACES.
 - No escribas párrafos genéricos. Cada oración debe contener un dato específico y verificable.
-- Si un dato no está confirmado, márcalo explícitamente como "no verificado" o "según [fuente única]".
-- La tabla resumen es OBLIGATORIA — permite al lector ver el panorama completo de un vistazo.
-- Distingue CLARAMENTE entre hechos verificados y afirmaciones no confirmadas.
+- Si un dato no está confirmado, márcalo como "no verificado" o "según [fuente única]".
+- La tabla resumen es OBLIGATORIA.
 - Escribe en español formal periodístico.
-- No inventes información que no esté en los hallazgos proporcionados.
+- No inventes información que no esté en los learnings proporcionados.
 - Apunta a un informe extenso y detallado. La profundidad es más valiosa que la brevedad."""
 
 
@@ -251,9 +292,7 @@ def create_claude_client(api_key: str) -> Anthropic:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-MAX_PERPLEXITY_CHARS = 4000  # Límite por respuesta de Perplexity al almacenar
-MAX_CASE_CHARS = 8000       # Límite por caso en síntesis
-MAX_VERIFY_CHARS = 60000    # Límite total para verificación cruzada
+MAX_VERIFY_CHARS = 80000  # Límite total para verificación cruzada
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -282,7 +321,7 @@ def _build_context_instructions(config: ResearchConfig) -> str:
     """Construye instrucciones de contexto para la generación de queries."""
     parts = []
     if config.angle:
-        parts.append(f"ÁNGULO ESPECÍFICO: El periodista quiere investigar desde la perspectiva de: {config.angle}. Enfoca las consultas en este ángulo.")
+        parts.append(f"ÁNGULO ESPECÍFICO: El periodista quiere investigar desde la perspectiva de: {config.angle}.")
     if config.scope:
         parts.append(f"ALCANCE: Limita la búsqueda a: {config.scope}.")
     if config.source_type and config.source_type != "Todos":
@@ -300,22 +339,27 @@ def _build_context_instructions(config: ResearchConfig) -> str:
 
 # ── Fase 1: Descubrimiento ──────────────────────────────────────────────────
 
-def generate_discovery_queries(claude: Anthropic, config: ResearchConfig) -> list[str]:
-    """Genera queries amplias para descubrir todos los casos/subtemas. [HAIKU]"""
+def generate_discovery_queries(claude: Anthropic, config: ResearchConfig) -> list[dict]:
+    """Genera queries con research goals para descubrimiento. [HAIKU]"""
     context_instructions = _build_context_instructions(config)
     system_prompt = DISCOVERY_QUERY_PROMPT.format(context_instructions=context_instructions)
 
     response = claude.messages.create(
         model=MODEL_LIGHT,
-        max_tokens=800,
+        max_tokens=1200,
         temperature=0.4,
         system=system_prompt,
         messages=[{"role": "user", "content": config.topic}],
     )
-    return _parse_json_response(response.content[0].text)
+    result = _parse_json_response(response.content[0].text)
+
+    # Normalizar: si viene como lista de strings, convertir a objetos
+    if result and isinstance(result[0], str):
+        return [{"query": q, "research_goal": "Descubrir información general"} for q in result]
+    return result
 
 
-def search_perplexity(perplexity: OpenAI, query: str, detailed: bool = False) -> tuple[str, list[Source]]:
+def search_perplexity(perplexity: OpenAI, query: str, research_goal: str = "", detailed: bool = False) -> tuple[str, list[Source]]:
     """Busca en Perplexity y devuelve el contenido + fuentes."""
     if detailed:
         system_msg = (
@@ -342,11 +386,16 @@ def search_perplexity(perplexity: OpenAI, query: str, detailed: bool = False) ->
             "Responde en español aunque la consulta sea en inglés."
         )
 
+    # Agregar research_goal al query para búsquedas más enfocadas
+    full_query = query
+    if research_goal:
+        full_query = f"{query}\n\n[Objetivo de investigación: {research_goal}]"
+
     response = perplexity.chat.completions.create(
         model="sonar-pro",
         messages=[
             {"role": "system", "content": system_msg},
-            {"role": "user", "content": query},
+            {"role": "user", "content": full_query},
         ],
         search_recency_filter="month",
         return_related_questions=True,
@@ -385,13 +434,14 @@ def analyze_discovery(
     return _parse_json_response(response.content[0].text)
 
 
-# ── Fase 2: Profundización ──────────────────────────────────────────────────
+# ── Fase 2: Profundización con Learnings ─────────────────────────────────────
 
 def generate_deep_dive_queries(
-    claude: Anthropic, case: dict, config: ResearchConfig
-) -> list[str]:
-    """Genera queries específicas para profundizar en un caso individual. [HAIKU]"""
+    claude: Anthropic, case: dict, config: ResearchConfig, prior_learnings: list[str] = None
+) -> list[dict]:
+    """Genera queries con research goals para profundizar en un caso. [HAIKU]"""
     context_instructions = _build_context_instructions(config)
+    learnings_text = "\n".join(f"- {l}" for l in (prior_learnings or [])) or "Ninguno aún."
 
     prompt = DEEP_DIVE_QUERY_PROMPT.format(
         case_name=case["name"],
@@ -399,32 +449,60 @@ def generate_deep_dive_queries(
         key_actors=", ".join(case.get("key_actors", [])),
         topic=config.topic,
         context_instructions=context_instructions,
+        prior_learnings=learnings_text,
     )
 
     response = claude.messages.create(
         model=MODEL_LIGHT,
-        max_tokens=500,
+        max_tokens=800,
         temperature=0.4,
         messages=[{"role": "user", "content": prompt}],
     )
 
     try:
-        queries = _parse_json_response(response.content[0].text)
+        result = _parse_json_response(response.content[0].text)
+        if result and isinstance(result[0], str):
+            return [{"query": q, "research_goal": ""} for q in result]
+        return result
     except (json.JSONDecodeError, IndexError):
-        queries = [f"{case['name']} {config.topic} detalles cronología"]
+        return [{"query": f"{case['name']} {config.topic} detalles", "research_goal": "Obtener información general del caso"}]
 
-    return queries
+
+def extract_learnings(
+    claude: Anthropic, case_name: str, search_content: str, research_goal: str
+) -> dict:
+    """Extrae learnings concretos de una búsqueda. [HAIKU — muy económico]"""
+    prompt = EXTRACT_LEARNINGS_PROMPT.format(
+        case_name=case_name,
+        search_content=_truncate(search_content, 6000),
+        research_goal=research_goal,
+    )
+
+    response = claude.messages.create(
+        model=MODEL_LIGHT,
+        max_tokens=1500,
+        temperature=0.2,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    try:
+        return _parse_json_response(response.content[0].text)
+    except (json.JSONDecodeError, IndexError):
+        return {"learnings": [], "contradictions": [], "gaps": []}
 
 
 # ── Verificación y síntesis ─────────────────────────────────────────────────
 
 def cross_verify(
-    claude: Anthropic, topic: str, all_findings: list[str], contradictions: list[str]
+    claude: Anthropic, topic: str, all_learnings: list[str], contradictions: list[str]
 ) -> dict:
     """Verificación cruzada de toda la información recopilada. [SONNET]"""
+    learnings_text = "\n".join(f"- {l}" for l in all_learnings)
+    learnings_text = _truncate(learnings_text, MAX_VERIFY_CHARS)
+
     prompt = CROSS_VERIFICATION_PROMPT.format(
         topic=topic,
-        all_findings="\n\n".join(all_findings),
+        all_learnings=learnings_text,
         contradictions="\n".join(f"- {c}" for c in contradictions) if contradictions else "Ninguna detectada aún.",
     )
 
@@ -491,40 +569,38 @@ def synthesize_report(
             overview_parts.append(r.findings)
     overview = "\n\n".join(overview_parts) if overview_parts else "No disponible."
 
-    # Detalle de cada caso — usa los hallazgos crudos de Perplexity
-    cases_detail_parts = []
+    # Learnings por caso — compactos y densos en información
+    cases_learnings_parts = []
     for case in state.discovered_cases:
         case_name = case.get("name", "Sin nombre")
-        case_findings = []
+        case_learnings = []
 
         for r in state.rounds:
             if r.phase == "deep_dive" and r.case_name == case_name:
-                case_findings.append(r.findings)
+                case_learnings.extend(r.learnings)
 
-        if case_findings:
-            combined = "\n\n".join(case_findings)
-            combined = _truncate(combined, MAX_CASE_CHARS)
-            cases_detail_parts.append(
+        if case_learnings:
+            learnings_formatted = "\n".join(f"- {l}" for l in case_learnings)
+            cases_learnings_parts.append(
                 f"### {case_name}\n"
                 f"**Descripción:** {case.get('description', '')}\n"
                 f"**Actores clave:** {', '.join(case.get('key_actors', []))}\n\n"
-                f"**Hallazgos de búsqueda:**\n" + combined
+                f"**Learnings:**\n{learnings_formatted}"
             )
         else:
-            cases_detail_parts.append(
+            cases_learnings_parts.append(
                 f"### {case_name}\n"
                 f"**Descripción:** {case.get('description', '')}\n"
-                f"**Actores clave:** {', '.join(case.get('key_actors', []))}\n"
-                f"*No se realizó profundización individual para este caso.*"
+                f"**Actores clave:** {', '.join(case.get('key_actors', []))}"
             )
 
-    cases_detail = "\n\n---\n\n".join(cases_detail_parts) if cases_detail_parts else "No se identificaron casos individuales."
+    cases_learnings = "\n\n---\n\n".join(cases_learnings_parts) if cases_learnings_parts else "No se identificaron casos individuales."
 
     prompt = SYNTHESIS_PROMPT.format(
         topic=config.topic,
         research_context=research_context,
         overview=overview,
-        cases_detail=cases_detail,
+        cases_learnings=cases_learnings,
         verification=json.dumps(verification, ensure_ascii=False, indent=2),
         sources_list=sources_list,
     )
@@ -553,8 +629,8 @@ def run_research(
 ) -> ResearchState:
     """
     Ejecuta el loop completo de investigación en dos fases.
-    Optimizado: Haiku para tareas mecánicas, Perplexity para investigación pesada,
-    Sonnet solo para análisis de descubrimiento, verificación y síntesis final.
+    Fase 1: Descubrimiento amplio.
+    Fase 2: Profundización con extracción de learnings concretos.
     """
     claude = create_claude_client(anthropic_key)
     perplexity = create_perplexity_client(perplexity_key)
@@ -574,18 +650,20 @@ def run_research(
     status("**FASE 1: Descubrimiento**")
     status("Mapeando el universo de casos y subtemas...")
 
-    # Generar queries de descubrimiento [HAIKU]
+    # Generar queries con research goals [HAIKU]
     round_counter += 1
     status("Generando consultas de descubrimiento (ES + EN)...")
-    discovery_queries = generate_discovery_queries(claude, config)
-    status(f"Buscando con {len(discovery_queries)} consultas...")
+    discovery_query_objects = generate_discovery_queries(claude, config)
+    status(f"Buscando con {len(discovery_query_objects)} consultas...")
 
     # Buscar en Perplexity
     discovery_contents = []
     discovery_sources = []
-    for query in discovery_queries:
+    for qobj in discovery_query_objects:
+        query = qobj["query"] if isinstance(qobj, dict) else qobj
+        goal = qobj.get("research_goal", "") if isinstance(qobj, dict) else ""
         status(f"&nbsp;&nbsp;&rarr; *{query}*")
-        content, sources = search_perplexity(perplexity, query)
+        content, sources = search_perplexity(perplexity, query, research_goal=goal)
         discovery_contents.append(content)
         discovery_sources.extend(sources)
         time.sleep(0.3)
@@ -600,9 +678,10 @@ def run_research(
     all_contradictions.extend(discovery_contradictions)
     completeness = discovery.get("discovery_completeness", 50)
 
+    query_strings = [q["query"] if isinstance(q, dict) else q for q in discovery_query_objects]
     state.rounds.append(RoundResult(
         round_number=round_counter,
-        queries=discovery_queries,
+        queries=query_strings,
         findings=overview,
         sources=discovery_sources,
         gaps=discovery.get("additional_discovery_queries", []),
@@ -632,7 +711,6 @@ def run_research(
             extra_sources.extend(sources)
             time.sleep(0.3)
 
-        # Re-analizar con toda la información [SONNET — solo si completitud baja]
         all_discovery_contents = discovery_contents + extra_contents
         status("Re-analizando con información ampliada...")
         discovery2 = analyze_discovery(claude, config, all_discovery_contents)
@@ -665,9 +743,8 @@ def run_research(
     status(f"**Total de casos identificados: {total_cases}**")
 
     # ════════════════════════════════════════════════════════════════════════
-    # FASE 2: PROFUNDIZACIÓN
+    # FASE 2: PROFUNDIZACIÓN CON LEARNINGS
     # ════════════════════════════════════════════════════════════════════════
-    # Configuración según modo
     mode_config = {
         "fast":  {"max_cases": 0,  "queries_per_case": 0},
         "mid":   {"max_cases": 5,  "queries_per_case": 1},
@@ -679,7 +756,6 @@ def run_research(
         status("**FASE 2: Profundización**")
         status("Investigando los casos más importantes en detalle...")
 
-        # Ordenar por importancia
         importance_order = {"alto": 0, "medio": 1, "bajo": 2}
         sorted_cases = sorted(cases, key=lambda c: importance_order.get(c.get("importance", "medio"), 1))
 
@@ -694,39 +770,57 @@ def run_research(
             case_name = case["name"]
             status(f"**Caso {idx}/{max_deep_dive}: {case_name}**")
 
-            # Generar queries específicas [HAIKU]
+            # Generar queries con research goals [HAIKU]
             status("Generando consultas específicas...")
-            all_queries = generate_deep_dive_queries(claude, case, config)
-            queries = all_queries[:mc["queries_per_case"]]
+            all_query_objects = generate_deep_dive_queries(
+                claude, case, config, prior_learnings=state.all_learnings
+            )
+            query_objects = all_query_objects[:mc["queries_per_case"]]
 
-            # Buscar en Perplexity con modo detallado
-            case_contents = []
+            # Buscar en Perplexity y extraer learnings
+            case_learnings = []
             case_sources = []
-            for query in queries:
+            case_queries = []
+
+            for qobj in query_objects:
+                query = qobj["query"] if isinstance(qobj, dict) else qobj
+                goal = qobj.get("research_goal", "") if isinstance(qobj, dict) else ""
+                case_queries.append(query)
+
                 status(f"&nbsp;&nbsp;&rarr; *{query}*")
-                content, sources = search_perplexity(perplexity, query, detailed=True)
-                case_contents.append(content)
+                content, sources = search_perplexity(perplexity, query, research_goal=goal, detailed=True)
                 case_sources.extend(sources)
+
+                # Extraer learnings de esta búsqueda [HAIKU — económico]
+                status(f"Extrayendo datos clave...")
+                extraction = extract_learnings(claude, case_name, content, goal)
+
+                new_learnings = extraction.get("learnings", [])
+                case_learnings.extend(new_learnings)
+                all_contradictions.extend(extraction.get("contradictions", []))
+
                 time.sleep(0.3)
 
-            # Guardar resultados de Perplexity truncados (SIN pasar por Claude)
-            truncated_contents = [_truncate(c, MAX_PERPLEXITY_CHARS) for c in case_contents]
-            findings_text = "\n\n---\n\n".join(truncated_contents)
+            # Agregar learnings al estado global
+            state.all_learnings.extend(case_learnings)
+
+            findings_text = "\n".join(f"- {l}" for l in case_learnings)
 
             state.rounds.append(RoundResult(
                 round_number=round_counter,
-                queries=queries,
+                queries=case_queries,
                 findings=findings_text,
                 sources=case_sources,
                 gaps=[],
                 coverage_score=0,
                 follow_up_queries=[],
+                learnings=case_learnings,
                 phase="deep_dive",
                 case_name=case_name,
             ))
             state.all_sources.extend(case_sources)
 
-            status(f"Datos recopilados para {case_name}")
+            status(f"{len(case_learnings)} datos extraídos para {case_name}")
     else:
         status("Modo rápido — sintetizando con datos de descubrimiento...")
 
@@ -734,23 +828,13 @@ def run_research(
     # FASE 3: VERIFICACIÓN Y SÍNTESIS
     # ════════════════════════════════════════════════════════════════════════
     status("**Verificación cruzada de fuentes...**")
-    # Limitar texto para no exceder contexto de Claude
-    all_findings_text = [r.findings for r in state.rounds]
-    verify_text = []
-    total_chars = 0
-    for f in all_findings_text:
-        if total_chars + len(f) > MAX_VERIFY_CHARS:
-            verify_text.append(_truncate(f, MAX_VERIFY_CHARS - total_chars))
-            break
-        verify_text.append(f)
-        total_chars += len(f)
-    verification = cross_verify(claude, config.topic, verify_text, all_contradictions)
+    verification = cross_verify(claude, config.topic, state.all_learnings, all_contradictions)
     state.contradictions = all_contradictions
 
     status("**Generando resumen ejecutivo...**")
-    combined_findings = "\n\n".join(all_findings_text)
+    learnings_summary = "\n".join(f"- {l}" for l in state.all_learnings[:50])
     state.executive_summary = generate_executive_summary(
-        claude, config.topic, combined_findings, verification, len(cases)
+        claude, config.topic, learnings_summary, verification, len(cases)
     )
 
     state.status = "synthesizing"
