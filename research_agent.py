@@ -397,8 +397,10 @@ def search_perplexity(perplexity: OpenAI, query: str, research_goal: str = "", d
             {"role": "system", "content": system_msg},
             {"role": "user", "content": full_query},
         ],
-        search_recency_filter="month",
-        return_related_questions=True,
+        extra_body={
+            "search_recency_filter": "month",
+            "return_related_questions": True,
+        },
     )
     content = response.choices[0].message.content
     sources = []
